@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -16,6 +17,7 @@ typedef struct {
     char *input_file;
     char *output_file;
     int   append;
+    int   background;       
 } Command;
 
 typedef struct {
@@ -23,7 +25,6 @@ typedef struct {
     int     num_commands;
 } Pipeline;
 
-/* Parse input into Pipeline struct — detects |, >, >>, < */
 Pipeline parse_input(char *input) {
     Pipeline pipeline;
     memset(&pipeline, 0, sizeof(Pipeline));
@@ -36,8 +37,7 @@ Pipeline parse_input(char *input) {
     while (token != NULL) {
         if (strcmp(token, "|") == 0) {
             pipeline.commands[cmd_idx].args[arg_idx] = NULL;
-            cmd_idx++;
-            arg_idx = 0;
+            cmd_idx++; arg_idx = 0;
             pipeline.num_commands++;
         } else if (strcmp(token, ">") == 0) {
             token = strtok(NULL, " \t");
@@ -50,6 +50,8 @@ Pipeline parse_input(char *input) {
         } else if (strcmp(token, "<") == 0) {
             token = strtok(NULL, " \t");
             pipeline.commands[cmd_idx].input_file = token;
+        } else if (strcmp(token, "&") == 0) {
+            pipeline.commands[cmd_idx].background = 1; 
         } else {
             pipeline.commands[cmd_idx].args[arg_idx++] = token;
         }
@@ -76,53 +78,38 @@ void setup_redirection(Command *cmd) {
     }
 }
 
-/* Execute N commands connected by N-1 pipes */
 void execute_pipeline(Pipeline *pipeline, int *stat_loc) {
     int num_cmds = pipeline->num_commands;
     int pipes[MAX_COMMANDS - 1][2];
     pid_t pids[MAX_COMMANDS];
 
-    /* create all pipes upfront */
-    for (int i = 0; i < num_cmds - 1; i++) {
+    for (int i = 0; i < num_cmds - 1; i++)
         if (pipe(pipes[i]) < 0) { perror("pipe"); exit(1); }
-    }
 
     for (int i = 0; i < num_cmds; i++) {
         Command *cmd = &pipeline->commands[i];
-
         pids[i] = fork();
         if (pids[i] < 0) { perror("fork"); exit(1); }
 
         if (pids[i] == 0) {
-            /* connect stdin to previous pipe */
-            if (i > 0)
-                dup2(pipes[i-1][0], STDIN_FILENO);
-
-            /* connect stdout to next pipe */
-            if (i < num_cmds - 1)
-                dup2(pipes[i][1], STDOUT_FILENO);
-
-            /* close all pipe ends in child */
+            signal(SIGINT, SIG_DFL);
+            if (i > 0) dup2(pipes[i-1][0], STDIN_FILENO);
+            if (i < num_cmds - 1) dup2(pipes[i][1], STDOUT_FILENO);
             for (int j = 0; j < num_cmds - 1; j++) {
                 close(pipes[j][0]);
                 close(pipes[j][1]);
             }
-
             setup_redirection(cmd);
-
             execvp(cmd->args[0], cmd->args);
             perror(cmd->args[0]);
             exit(1);
         }
     }
 
-    /* parent closes all pipe ends */
     for (int i = 0; i < num_cmds - 1; i++) {
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
-
-    /* parent waits for all children */
     for (int i = 0; i < num_cmds; i++)
         waitpid(pids[i], stat_loc, WUNTRACED);
 }
@@ -131,6 +118,9 @@ int main() {
     char  *input;
     int    stat_loc;
 
+    /* prevent zombie processes from background children */
+    signal(SIGCHLD, SIG_IGN);             
+
     while (1) {
 
         input = readline("unixsh> ");
@@ -138,26 +128,27 @@ int main() {
         if (*input == '\0') { free(input); continue; }
 
         Pipeline pipeline = parse_input(input);
-        if (pipeline.commands[0].args[0] == NULL) {
-            free(input);
-            continue;
-        }
+        Command *cmd = &pipeline.commands[0];
+        if (cmd->args[0] == NULL) { free(input); continue; }
 
         if (pipeline.num_commands == 1) {
-            /* single command */
             pid_t child_pid = fork();
             if (child_pid < 0) { perror("fork"); exit(1); }
+
             if (child_pid == 0) {
-                setup_redirection(&pipeline.commands[0]);
-                execvp(pipeline.commands[0].args[0],
-                       pipeline.commands[0].args);
-                perror(pipeline.commands[0].args[0]);
+                signal(SIGINT, SIG_DFL);
+                setup_redirection(cmd);
+                execvp(cmd->args[0], cmd->args);
+                perror(cmd->args[0]);
                 exit(1);
             } else {
-                waitpid(child_pid, &stat_loc, WUNTRACED);
+                if (cmd->background) {
+                    printf("[bg] PID: %d\n", child_pid);
+                } else {
+                    waitpid(child_pid, &stat_loc, WUNTRACED);
+                }
             }
         } else {
-            /* pipeline */
             execute_pipeline(&pipeline, &stat_loc);
         }
 
